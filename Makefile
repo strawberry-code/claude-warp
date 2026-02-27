@@ -33,6 +33,7 @@ clean:
 
 install: $(APP_BUNDLE)
 	cp -r $(APP_BUNDLE) /Applications/
+	xattr -cr "/Applications/$(APP_NAME).app"
 	@echo "Installed to /Applications/$(APP_NAME).app"
 
 run: $(APP_BUNDLE)
