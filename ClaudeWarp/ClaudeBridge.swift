@@ -7,6 +7,16 @@ struct CLIResult {
     let isError: Bool
 }
 
+/// Eventi dal stream NDJSON di claude CLI.
+enum StreamEvent {
+    case messageStart([String: Any])
+    case contentBlockStart(Int, [String: Any])   // original index, full event
+    case contentBlockDelta(Int, [String: Any])   // original index, full event
+    case contentBlockStop(Int)                    // original index
+    case messageDelta([String: Any])
+    case messageStop
+}
+
 /// Gestione subprocess `claude -p` per chiamate headless.
 enum ClaudeBridge {
 
@@ -80,9 +90,9 @@ enum ClaudeBridge {
         return ""
     }
 
-    // MARK: - System prompt + tools
+    // MARK: - System prompt
 
-    static func buildSystemPrompt(system: Any?, tools: [[String: Any]]?) -> String? {
+    static func buildSystemPrompt(system: Any?) -> String? {
         var sysText = ""
 
         if let str = system as? String {
@@ -94,98 +104,12 @@ enum ClaudeBridge {
             }.joined(separator: "\n")
         }
 
-        if let tools = tools, !tools.isEmpty {
-            var toolDescs: [String] = []
-            for tool in tools {
-                let name = tool["name"] as? String ?? "unknown"
-                let desc = tool["description"] as? String ?? ""
-                let schema = tool["input_schema"] ?? [String: Any]()
-                if let jsonData = try? JSONSerialization.data(withJSONObject: schema, options: .prettyPrinted),
-                   let jsonStr = String(data: jsonData, encoding: .utf8) {
-                    toolDescs.append("- **\(name)**: \(desc)\n  Input schema: \(jsonStr)")
-                }
-            }
-
-            sysText += """
-
-            \n\n---
-            You have access to the following tools. To use a tool, respond with a JSON block like this:
-            ```tool_use
-            {"name": "tool_name", "input": {...}}
-            ```
-
-            Available tools:
-            \(toolDescs.joined(separator: "\n"))
-            """
-        }
-
         return sysText.isEmpty ? nil : sysText
     }
 
-    // MARK: - Parse tool_use blocks
+    // MARK: - Common environment
 
-    static func parseToolUse(from text: String) -> [[String: Any]] {
-        var blocks: [[String: Any]] = []
-        var remaining = text
-
-        while let range = remaining.range(of: "```tool_use") {
-            let before = String(remaining[remaining.startIndex..<range.lowerBound]).trimmingCharacters(in: .whitespacesAndNewlines)
-            if !before.isEmpty {
-                blocks.append(["type": "text", "text": before])
-            }
-
-            remaining = String(remaining[range.upperBound...])
-
-            guard let endRange = remaining.range(of: "```") else {
-                blocks.append(["type": "text", "text": "```tool_use\(remaining)"])
-                remaining = ""
-                break
-            }
-
-            let jsonStr = String(remaining[remaining.startIndex..<endRange.lowerBound]).trimmingCharacters(in: .whitespacesAndNewlines)
-            remaining = String(remaining[endRange.upperBound...])
-
-            if let data = jsonStr.data(using: .utf8),
-               let toolData = try? JSONSerialization.jsonObject(with: data) as? [String: Any] {
-                let toolId = "toolu_\(UUID().uuidString.replacingOccurrences(of: "-", with: "").prefix(24))"
-                blocks.append([
-                    "type": "tool_use",
-                    "id": toolId,
-                    "name": toolData["name"] as? String ?? "unknown",
-                    "input": toolData["input"] ?? [String: Any](),
-                ])
-            } else {
-                blocks.append(["type": "text", "text": "```tool_use\n\(jsonStr)\n```"])
-            }
-        }
-
-        let leftover = remaining.trimmingCharacters(in: .whitespacesAndNewlines)
-        if !leftover.isEmpty {
-            blocks.append(["type": "text", "text": leftover])
-        }
-
-        if blocks.isEmpty {
-            blocks.append(["type": "text", "text": text])
-        }
-
-        return blocks
-    }
-
-    // MARK: - Call CLI
-
-    static func call(prompt: String, systemPrompt: String?, modelFlag: String, claudePath: String, configDir: String? = nil) async throws -> CLIResult {
-        var args = [
-            "-p",
-            "--tools", "",
-            "--output-format", "json",
-            "--model", modelFlag,
-        ]
-
-        if let sys = systemPrompt {
-            args.append(contentsOf: ["--system-prompt", sys])
-        }
-
-        // Ambiente pulito per il subprocess claude
+    private static func buildEnvironment(configDir: String?) -> [String: String] {
         var env = ProcessInfo.processInfo.environment
         env.removeValue(forKey: "CLAUDECODE")
         env.removeValue(forKey: "CI")
@@ -197,16 +121,40 @@ enum ClaudeBridge {
             env["PATH"] = "/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin"
         }
 
-        // Set config directory per il settings.json dell'ambiente selezionato.
-        // Le credenziali OAuth restano in $HOME/.claude.json (gestite da Claude CLI).
         if let configDir = configDir {
             env["CLAUDE_CONFIG_DIR"] = configDir
         }
-        // Rimuovi CLAUDE_CONFIG_DIR se punta al default — evita conflitto con le credenziali OAuth
         let home = env["HOME"] ?? FileManager.default.homeDirectoryForCurrentUser.path
         if env["CLAUDE_CONFIG_DIR"] == "\(home)/.claude" {
             env.removeValue(forKey: "CLAUDE_CONFIG_DIR")
         }
+
+        return env
+    }
+
+    // MARK: - Allowed tools
+
+    private static let allowedTools = "Bash,Read,Edit,Write,Glob,Grep"
+
+    // MARK: - Call CLI (non-streaming)
+
+    static func call(prompt: String, systemPrompt: String?, modelFlag: String, claudePath: String,
+                     configDir: String? = nil, enableTools: Bool = false) async throws -> CLIResult {
+        var args = ["-p", "--output-format", "json", "--model", modelFlag, "--no-session-persistence"]
+
+        if enableTools {
+            args.append(contentsOf: ["--allowedTools", allowedTools])
+            if let sys = systemPrompt {
+                args.append(contentsOf: ["--append-system-prompt", sys])
+            }
+        } else {
+            args.append(contentsOf: ["--tools", ""])
+            if let sys = systemPrompt {
+                args.append(contentsOf: ["--system-prompt", sys])
+            }
+        }
+
+        let env = buildEnvironment(configDir: configDir)
 
         return try await withCheckedThrowingContinuation { continuation in
             DispatchQueue.global(qos: .userInitiated).async {
@@ -232,7 +180,6 @@ enum ClaudeBridge {
                     return
                 }
 
-                // Write prompt to stdin and close
                 let promptData = prompt.data(using: .utf8) ?? Data()
                 stdinPipe.fileHandleForWriting.write(promptData)
                 stdinPipe.fileHandleForWriting.closeFile()
@@ -271,6 +218,145 @@ enum ClaudeBridge {
 
                 continuation.resume(returning: CLIResult(
                     text: result,
+                    inputTokens: inputTokens,
+                    outputTokens: outputTokens,
+                    isError: isError
+                ))
+            }
+        }
+    }
+
+    // MARK: - Call CLI (streaming via NDJSON)
+
+    static func callStreaming(
+        prompt: String,
+        systemPrompt: String?,
+        modelFlag: String,
+        claudePath: String,
+        configDir: String? = nil,
+        enableTools: Bool = false,
+        onEvent: @escaping (StreamEvent) -> Void
+    ) async throws -> CLIResult {
+        var args = [
+            "-p",
+            "--output-format", "stream-json",
+            "--verbose",
+            "--no-session-persistence",
+            "--model", modelFlag,
+        ]
+
+        if enableTools {
+            args.append(contentsOf: ["--allowedTools", allowedTools])
+        } else {
+            args.append(contentsOf: ["--tools", ""])
+        }
+
+        if let sys = systemPrompt {
+            args.append(contentsOf: [enableTools ? "--append-system-prompt" : "--system-prompt", sys])
+        }
+
+        let env = buildEnvironment(configDir: configDir)
+
+        return try await withCheckedThrowingContinuation { continuation in
+            DispatchQueue.global(qos: .userInitiated).async {
+                let process = Process()
+                let stdoutPipe = Pipe()
+                let stderrPipe = Pipe()
+                let stdinPipe = Pipe()
+
+                process.executableURL = URL(fileURLWithPath: claudePath)
+                process.arguments = args
+                process.environment = env
+                process.standardOutput = stdoutPipe
+                process.standardError = stderrPipe
+                process.standardInput = stdinPipe
+
+                do {
+                    try process.run()
+                } catch {
+                    continuation.resume(returning: CLIResult(
+                        text: "Failed to launch claude CLI: \(error.localizedDescription)",
+                        inputTokens: 0, outputTokens: 0, isError: true
+                    ))
+                    return
+                }
+
+                let promptData = prompt.data(using: .utf8) ?? Data()
+                stdinPipe.fileHandleForWriting.write(promptData)
+                stdinPipe.fileHandleForWriting.closeFile()
+
+                // Read NDJSON from stdout incrementally
+                let handle = stdoutPipe.fileHandleForReading
+                var buffer = Data()
+                var inputTokens = 0
+                var outputTokens = 0
+                var resultText = ""
+                var isError = false
+                let newline = Data([0x0A])
+
+                while true {
+                    let chunk = handle.availableData
+                    if chunk.isEmpty { break }  // EOF
+                    buffer.append(chunk)
+
+                    while let nlRange = buffer.range(of: newline) {
+                        let lineData = Data(buffer[buffer.startIndex..<nlRange.lowerBound])
+                        buffer = Data(buffer[nlRange.upperBound...])
+
+                        guard !lineData.isEmpty,
+                              let json = try? JSONSerialization.jsonObject(with: lineData) as? [String: Any] else { continue }
+
+                        switch json["type"] as? String {
+                        case "stream_event":
+                            guard let event = json["event"] as? [String: Any],
+                                  let eventType = event["type"] as? String else { continue }
+
+                            switch eventType {
+                            case "message_start":
+                                onEvent(.messageStart(event))
+                            case "content_block_start":
+                                let index = event["index"] as? Int ?? 0
+                                onEvent(.contentBlockStart(index, event))
+                            case "content_block_delta":
+                                let index = event["index"] as? Int ?? 0
+                                onEvent(.contentBlockDelta(index, event))
+                            case "content_block_stop":
+                                let index = event["index"] as? Int ?? 0
+                                onEvent(.contentBlockStop(index))
+                            case "message_delta":
+                                onEvent(.messageDelta(event))
+                            case "message_stop":
+                                onEvent(.messageStop)
+                            default:
+                                break
+                            }
+
+                        case "result":
+                            resultText = json["result"] as? String ?? ""
+                            isError = json["is_error"] as? Bool ?? false
+                            if let usage = json["usage"] as? [String: Any] {
+                                inputTokens = usage["input_tokens"] as? Int ?? 0
+                                outputTokens = usage["output_tokens"] as? Int ?? 0
+                            }
+
+                        default:
+                            break  // system, assistant, rate_limit_event — skip
+                        }
+                    }
+                }
+
+                process.waitUntilExit()
+
+                if process.terminationStatus != 0 && resultText.isEmpty {
+                    let stderrData = stderrPipe.fileHandleForReading.readDataToEndOfFile()
+                    let stderr = String(data: stderrData, encoding: .utf8)?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+                    resultText = stderr.isEmpty ? "exit code \(process.terminationStatus)" : stderr
+                    isError = true
+                    print("[ClaudeWarp] CLI streaming failed: exit=\(process.terminationStatus) stderr=\(stderr.prefix(200))")
+                }
+
+                continuation.resume(returning: CLIResult(
+                    text: resultText,
                     inputTokens: inputTokens,
                     outputTokens: outputTokens,
                     isError: isError

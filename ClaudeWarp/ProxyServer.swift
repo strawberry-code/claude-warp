@@ -183,7 +183,7 @@ final class ProxyServer: @unchecked Sendable {
             handleMessages(request, on: connection)
 
         default:
-            print("[ClaudeWarp] ⚠ 404 Not Found: \(request.method) \(request.path)")
+            print("[ClaudeWarp] 404 Not Found: \(request.method) \(request.path)")
             let body = #"{"type":"error","error":{"type":"not_found_error","message":"Not Found"}}"#.data(using: .utf8)!
             sendResponse(on: connection, status: 404, statusText: "Not Found",
                         headers: corsHeaders(contentType: "application/json"), body: body)
@@ -241,7 +241,7 @@ final class ProxyServer: @unchecked Sendable {
         let stream = json["stream"] as? Bool ?? false
 
         let prompt = ClaudeBridge.formatMessages(messages)
-        let systemPrompt = ClaudeBridge.buildSystemPrompt(system: system, tools: tools)
+        let systemPrompt = ClaudeBridge.buildSystemPrompt(system: system)
         let effectiveModel = state.selectedModel.isEmpty ? modelName : state.selectedModel
         let modelFlag = ClaudeBridge.resolveModelFlag(effectiveModel)
         let claudePath = state.claudePath
@@ -250,66 +250,48 @@ final class ProxyServer: @unchecked Sendable {
         let hasTools = tools != nil && !(tools!.isEmpty)
 
         let envName = state.activeEnvironment?.name ?? "default"
-        print("[ClaudeWarp] env=\(envName) | model=\(modelName) → --model \(modelFlag) | messages=\(messages.count) | tools=\(tools?.count ?? 0) | stream=\(stream)")
+        print("[ClaudeWarp] env=\(envName) | model=\(modelName) -> --model \(modelFlag) | messages=\(messages.count) | tools=\(tools?.count ?? 0) | stream=\(stream) | enableTools=\(hasTools)")
 
-        Task {
-            let startTime = Date()
-            let result: CLIResult
-            do {
-                result = try await ClaudeBridge.call(prompt: prompt, systemPrompt: systemPrompt, modelFlag: modelFlag, claudePath: claudePath, configDir: configDir)
-            } catch {
-                result = CLIResult(text: "Bridge error: \(error.localizedDescription)", inputTokens: 0, outputTokens: 0, isError: true)
-            }
-
-            let elapsed = Date().timeIntervalSince(startTime)
-            print("[ClaudeWarp] claude responded in \(String(format: "%.1f", elapsed))s | error=\(result.isError)")
-
-            if result.isError {
-                DispatchQueue.main.async { self.state.lastError = result.text }
-            }
-
-            let msgId = "msg_proxy_\(UUID().uuidString.replacingOccurrences(of: "-", with: "").prefix(24))"
-
-            // Parse tool_use blocks if tools were provided
-            let contentBlocks: [[String: Any]]
-            if hasTools {
-                contentBlocks = ClaudeBridge.parseToolUse(from: result.text)
-            } else {
-                contentBlocks = [["type": "text", "text": result.text]]
-            }
-
-            let hasToolUse = contentBlocks.contains { ($0["type"] as? String) == "tool_use" }
-            let stopReason = hasToolUse ? "tool_use" : "end_turn"
-
-            if result.isError {
-                let errorBody: [String: Any] = [
-                    "type": "error",
-                    "error": ["type": "api_error", "message": result.text]
-                ]
-                if stream {
-                    let eventData = try! JSONSerialization.data(withJSONObject: errorBody)
-                    let event = "event: error\ndata: \(String(data: eventData, encoding: .utf8)!)\n\n"
-                    self.sendSSE(on: connection, events: event)
-                } else {
-                    let body = try! JSONSerialization.data(withJSONObject: errorBody)
-                    self.sendResponse(on: connection, status: 500, statusText: "Internal Server Error",
-                                    headers: self.corsHeaders(contentType: "application/json"), body: body)
+        if stream {
+            sendRealStreamingResponse(
+                on: connection, prompt: prompt, systemPrompt: systemPrompt,
+                modelFlag: modelFlag, modelName: modelName,
+                claudePath: claudePath, configDir: configDir, enableTools: hasTools
+            )
+        } else {
+            Task {
+                let startTime = Date()
+                let result: CLIResult
+                do {
+                    result = try await ClaudeBridge.call(
+                        prompt: prompt, systemPrompt: systemPrompt,
+                        modelFlag: modelFlag, claudePath: claudePath,
+                        configDir: configDir, enableTools: hasTools
+                    )
+                } catch {
+                    let errResult = CLIResult(text: "Bridge error: \(error.localizedDescription)",
+                                              inputTokens: 0, outputTokens: 0, isError: true)
+                    self.sendErrorResponse(on: connection, result: errResult, stream: false)
+                    return
                 }
-                return
-            }
 
-            if stream {
-                self.sendStreamingResponse(on: connection, msgId: msgId, modelName: modelName,
-                                          contentBlocks: contentBlocks, stopReason: stopReason,
-                                          inputTokens: result.inputTokens, outputTokens: result.outputTokens)
-            } else {
+                let elapsed = Date().timeIntervalSince(startTime)
+                print("[ClaudeWarp] claude responded in \(String(format: "%.1f", elapsed))s | error=\(result.isError)")
+
+                if result.isError {
+                    DispatchQueue.main.async { self.state.lastError = result.text }
+                    self.sendErrorResponse(on: connection, result: result, stream: false)
+                    return
+                }
+
+                let msgId = "msg_proxy_\(UUID().uuidString.replacingOccurrences(of: "-", with: "").prefix(24))"
                 let response: [String: Any] = [
                     "id": msgId,
                     "type": "message",
                     "role": "assistant",
-                    "content": contentBlocks,
+                    "content": [["type": "text", "text": result.text]],
                     "model": modelName,
-                    "stop_reason": stopReason,
+                    "stop_reason": "end_turn",
                     "stop_sequence": NSNull(),
                     "usage": [
                         "input_tokens": result.inputTokens,
@@ -325,137 +307,263 @@ final class ProxyServer: @unchecked Sendable {
         }
     }
 
-    // MARK: - SSE streaming response (Anthropic Messages API spec)
+    // MARK: - Real streaming response (NDJSON → SSE relay)
 
-    private func sendStreamingResponse(on connection: NWConnection, msgId: String, modelName: String,
-                                       contentBlocks: [[String: Any]], stopReason: String,
-                                       inputTokens: Int, outputTokens: Int) {
-        var events = ""
+    private func sendRealStreamingResponse(
+        on connection: NWConnection,
+        prompt: String,
+        systemPrompt: String?,
+        modelFlag: String,
+        modelName: String,
+        claudePath: String,
+        configDir: String?,
+        enableTools: Bool
+    ) {
+        Task {
+            let startTime = Date()
+            let msgId = "msg_proxy_\(UUID().uuidString.replacingOccurrences(of: "-", with: "").prefix(24))"
 
-        // 1. message_start — usage.output_tokens inizia a 1 come da spec
-        events += sseEvent("message_start", data: [
-            "type": "message_start",
-            "message": [
-                "id": msgId,
-                "type": "message",
-                "role": "assistant",
-                "content": [] as [Any],
-                "model": modelName,
-                "stop_reason": NSNull(),
-                "stop_sequence": NSNull(),
-                "usage": ["input_tokens": inputTokens, "output_tokens": 1, "cache_creation_input_tokens": 0, "cache_read_input_tokens": 0],
-            ] as [String: Any],
-        ])
+            // Mutable state per il relay multi-turn
+            var headersSent = false
+            var messageStartSent = false
+            var virtualIndex = 0        // indice ricalcolato (solo text blocks)
+            var activeTextBlock = false  // dentro un text block?
+            var pingSent = false
+            var lastMessageDelta: [String: Any]? = nil
 
-        // 2. content blocks
-        for (idx, block) in contentBlocks.enumerated() {
-            let blockType = block["type"] as? String ?? "text"
+            // --- Helper per inviare dati sulla connessione ---
 
-            if blockType == "text" {
-                let text = block["text"] as? String ?? ""
+            func sendHeaders() {
+                guard !headersSent else { return }
+                headersSent = true
+                let h = "HTTP/1.1 200 OK\r\n"
+                    + self.corsHeaders(contentType: "text/event-stream")
+                    + "Cache-Control: no-cache\r\n"
+                    + "\r\n"
+                if let data = h.data(using: .utf8) {
+                    connection.send(content: data, completion: .contentProcessed { _ in })
+                }
+            }
 
-                // content_block_start
-                events += sseEvent("content_block_start", data: [
+            func sendSSEEvent(_ event: String, _ data: [String: Any]) {
+                guard let jsonData = try? JSONSerialization.data(withJSONObject: data),
+                      let jsonStr = String(data: jsonData, encoding: .utf8) else { return }
+                let sse = "event: \(event)\ndata: \(jsonStr)\n\n"
+                if let sseData = sse.data(using: .utf8) {
+                    connection.send(content: sseData, completion: .contentProcessed { _ in })
+                }
+            }
+
+            func finishConnection(_ event: String, _ data: [String: Any]) {
+                guard let jsonData = try? JSONSerialization.data(withJSONObject: data),
+                      let jsonStr = String(data: jsonData, encoding: .utf8) else {
+                    connection.cancel()
+                    return
+                }
+                let sse = "event: \(event)\ndata: \(jsonStr)\n\n"
+                if let sseData = sse.data(using: .utf8) {
+                    connection.send(content: sseData, contentContext: .finalMessage, isComplete: true,
+                                   completion: .contentProcessed { _ in connection.cancel() })
+                }
+            }
+
+            // --- Streaming call ---
+
+            let result: CLIResult
+            do {
+                result = try await ClaudeBridge.callStreaming(
+                    prompt: prompt,
+                    systemPrompt: systemPrompt,
+                    modelFlag: modelFlag,
+                    claudePath: claudePath,
+                    configDir: configDir,
+                    enableTools: enableTools
+                ) { event in
+                    switch event {
+
+                    // --- message_start: relay solo il primo ---
+                    case .messageStart(let data):
+                        guard !messageStartSent else { return }
+                        messageStartSent = true
+                        sendHeaders()
+
+                        var modified = data
+                        if var message = modified["message"] as? [String: Any] {
+                            message["id"] = msgId
+                            message["content"] = [] as [Any]
+                            message["stop_reason"] = NSNull()
+                            message["stop_sequence"] = NSNull()
+                            modified["message"] = message
+                        }
+                        sendSSEEvent("message_start", modified)
+
+                    // --- content_block_start: relay solo text, skip thinking/tool_use ---
+                    case .contentBlockStart(_, let data):
+                        let contentBlock = (data["content_block"] as? [String: Any]) ?? [:]
+                        let blockType = contentBlock["type"] as? String ?? ""
+
+                        if blockType == "text" {
+                            activeTextBlock = true
+                            sendSSEEvent("content_block_start", [
+                                "type": "content_block_start",
+                                "index": virtualIndex,
+                                "content_block": ["type": "text", "text": ""],
+                            ] as [String: Any])
+
+                            if !pingSent {
+                                pingSent = true
+                                sendSSEEvent("ping", ["type": "ping"])
+                            }
+                        } else {
+                            activeTextBlock = false
+                        }
+
+                    // --- content_block_delta: relay solo text_delta ---
+                    case .contentBlockDelta(_, let data):
+                        guard activeTextBlock else { return }
+                        let delta = (data["delta"] as? [String: Any]) ?? [:]
+                        let deltaType = delta["type"] as? String ?? ""
+
+                        if deltaType == "text_delta" {
+                            sendSSEEvent("content_block_delta", [
+                                "type": "content_block_delta",
+                                "index": virtualIndex,
+                                "delta": delta,
+                            ] as [String: Any])
+                        }
+
+                    // --- content_block_stop: relay solo se era text block ---
+                    case .contentBlockStop(_):
+                        guard activeTextBlock else { return }
+                        sendSSEEvent("content_block_stop", [
+                            "type": "content_block_stop",
+                            "index": virtualIndex,
+                        ] as [String: Any])
+                        virtualIndex += 1
+                        activeTextBlock = false
+
+                    // --- message_delta: salva (inviamo l'ultimo alla fine) ---
+                    case .messageDelta(let data):
+                        lastMessageDelta = data
+
+                    // --- message_stop: skip (inviamo alla fine) ---
+                    case .messageStop:
+                        break
+                    }
+                }
+            } catch {
+                result = CLIResult(text: "Bridge error: \(error.localizedDescription)",
+                                   inputTokens: 0, outputTokens: 0, isError: true)
+            }
+
+            let elapsed = Date().timeIntervalSince(startTime)
+            print("[ClaudeWarp] streaming response in \(String(format: "%.1f", elapsed))s | error=\(result.isError) | textBlocks=\(virtualIndex)")
+
+            if result.isError {
+                DispatchQueue.main.async { self.state.lastError = result.text }
+            }
+
+            // Assicura che headers siano stati inviati
+            sendHeaders()
+
+            // Errore: invia error event e chiudi
+            if result.isError {
+                finishConnection("error", [
+                    "type": "error",
+                    "error": ["type": "api_error", "message": result.text],
+                ])
+                return
+            }
+
+            // Fallback: se nessun text block è stato inviato ma abbiamo testo nel result
+            if virtualIndex == 0 && !result.text.isEmpty {
+                if !messageStartSent {
+                    sendSSEEvent("message_start", [
+                        "type": "message_start",
+                        "message": [
+                            "id": msgId,
+                            "type": "message",
+                            "role": "assistant",
+                            "content": [] as [Any],
+                            "model": modelName,
+                            "stop_reason": NSNull(),
+                            "stop_sequence": NSNull(),
+                            "usage": [
+                                "input_tokens": result.inputTokens,
+                                "output_tokens": 1,
+                                "cache_creation_input_tokens": 0,
+                                "cache_read_input_tokens": 0,
+                            ],
+                        ] as [String: Any],
+                    ])
+                }
+
+                sendSSEEvent("content_block_start", [
                     "type": "content_block_start",
-                    "index": idx,
+                    "index": 0,
                     "content_block": ["type": "text", "text": ""],
                 ] as [String: Any])
 
-                // ping dopo il primo content_block_start (come da spec)
-                if idx == 0 {
-                    events += sseEvent("ping", data: ["type": "ping"])
-                }
+                sendSSEEvent("ping", ["type": "ping"])
 
-                // content_block_delta — chunk da ~80 char (simula streaming realistico)
-                let chunkSize = 80
-                var i = text.startIndex
-                while i < text.endIndex {
-                    let end = text.index(i, offsetBy: chunkSize, limitedBy: text.endIndex) ?? text.endIndex
-                    let chunk = String(text[i..<end])
-                    events += sseEvent("content_block_delta", data: [
-                        "type": "content_block_delta",
-                        "index": idx,
-                        "delta": ["type": "text_delta", "text": chunk],
-                    ] as [String: Any])
-                    i = end
-                }
-
-                // content_block_stop
-                events += sseEvent("content_block_stop", data: [
-                    "type": "content_block_stop",
-                    "index": idx,
-                ] as [String: Any])
-
-            } else if blockType == "tool_use" {
-                // content_block_start per tool_use
-                events += sseEvent("content_block_start", data: [
-                    "type": "content_block_start",
-                    "index": idx,
-                    "content_block": [
-                        "type": "tool_use",
-                        "id": block["id"] as? String ?? "",
-                        "name": block["name"] as? String ?? "",
-                        "input": [String: Any](),
-                    ] as [String: Any],
-                ] as [String: Any])
-
-                // primo delta vuoto come da spec
-                events += sseEvent("content_block_delta", data: [
+                sendSSEEvent("content_block_delta", [
                     "type": "content_block_delta",
-                    "index": idx,
-                    "delta": ["type": "input_json_delta", "partial_json": ""],
+                    "index": 0,
+                    "delta": ["type": "text_delta", "text": result.text],
                 ] as [String: Any])
 
-                // input_json_delta con il JSON completo
-                let input = block["input"] ?? [String: Any]()
-                let inputJson = (try? JSONSerialization.data(withJSONObject: input))
-                    .flatMap { String(data: $0, encoding: .utf8) } ?? "{}"
-                events += sseEvent("content_block_delta", data: [
-                    "type": "content_block_delta",
-                    "index": idx,
-                    "delta": ["type": "input_json_delta", "partial_json": inputJson],
-                ] as [String: Any])
-
-                // content_block_stop
-                events += sseEvent("content_block_stop", data: [
+                sendSSEEvent("content_block_stop", [
                     "type": "content_block_stop",
-                    "index": idx,
+                    "index": 0,
                 ] as [String: Any])
             }
+
+            // message_delta — usa l'ultimo ricevuto o sintetizza
+            let messageDelta = lastMessageDelta ?? [
+                "type": "message_delta",
+                "delta": ["stop_reason": "end_turn", "stop_sequence": NSNull()] as [String: Any],
+                "usage": [
+                    "output_tokens": result.outputTokens,
+                    "cache_creation_input_tokens": 0,
+                    "cache_read_input_tokens": 0,
+                ],
+            ]
+            sendSSEEvent("message_delta", messageDelta)
+
+            // message_stop — ultimo evento, chiude la connessione
+            finishConnection("message_stop", ["type": "message_stop"])
         }
-
-        // 3. message_delta — usage.output_tokens è cumulativo
-        events += sseEvent("message_delta", data: [
-            "type": "message_delta",
-            "delta": ["stop_reason": stopReason, "stop_sequence": NSNull()] as [String: Any],
-            "usage": ["output_tokens": outputTokens, "cache_creation_input_tokens": 0, "cache_read_input_tokens": 0],
-        ] as [String: Any])
-
-        // 4. message_stop
-        events += sseEvent("message_stop", data: ["type": "message_stop"])
-
-        sendSSE(on: connection, events: events)
     }
 
-    private func sseEvent(_ event: String, data: [String: Any]) -> String {
-        guard let jsonData = try? JSONSerialization.data(withJSONObject: data),
-              let jsonStr = String(data: jsonData, encoding: .utf8) else { return "" }
-        return "event: \(event)\ndata: \(jsonStr)\n\n"
-    }
+    // MARK: - Error response helper
 
-    /// Invia la risposta SSE completa e chiude la connessione con TCP FIN (non RST).
-    private func sendSSE(on connection: NWConnection, events: String) {
-        let headers = corsHeaders(contentType: "text/event-stream")
-        + "Cache-Control: no-cache\r\n"
+    private func sendErrorResponse(on connection: NWConnection, result: CLIResult, stream: Bool) {
+        let errorBody: [String: Any] = [
+            "type": "error",
+            "error": ["type": "api_error", "message": result.text],
+        ]
 
-        let responseStr = "HTTP/1.1 200 OK\r\n\(headers)\r\n\(events)"
-        let responseData = responseStr.data(using: .utf8)!
-
-        // isComplete: true → TCP FIN graceful (non RST da cancel)
-        connection.send(content: responseData, contentContext: .finalMessage, isComplete: true,
-                       completion: .contentProcessed { _ in
-            connection.cancel()
-        })
+        if stream {
+            let headers = "HTTP/1.1 200 OK\r\n"
+                + corsHeaders(contentType: "text/event-stream")
+                + "Cache-Control: no-cache\r\n"
+                + "\r\n"
+            guard let jsonData = try? JSONSerialization.data(withJSONObject: errorBody),
+                  let jsonStr = String(data: jsonData, encoding: .utf8) else {
+                connection.cancel()
+                return
+            }
+            let sse = "event: error\ndata: \(jsonStr)\n\n"
+            let responseStr = headers + sse
+            if let data = responseStr.data(using: .utf8) {
+                connection.send(content: data, contentContext: .finalMessage, isComplete: true,
+                               completion: .contentProcessed { _ in connection.cancel() })
+            }
+        } else {
+            let body = try! JSONSerialization.data(withJSONObject: errorBody)
+            sendResponse(on: connection, status: 500, statusText: "Internal Server Error",
+                        headers: corsHeaders(contentType: "application/json"), body: body)
+        }
     }
 
     // MARK: - HTTP response helpers
