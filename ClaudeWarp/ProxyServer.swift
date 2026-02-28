@@ -184,7 +184,7 @@ final class ProxyServer: @unchecked Sendable {
 
         default:
             print("[ClaudeWarp] ⚠ 404 Not Found: \(request.method) \(request.path)")
-            let body = #"{"error":"Not Found"}"#.data(using: .utf8)!
+            let body = #"{"type":"error","error":{"type":"not_found_error","message":"Not Found"}}"#.data(using: .utf8)!
             sendResponse(on: connection, status: 404, statusText: "Not Found",
                         headers: corsHeaders(contentType: "application/json"), body: body)
         }
@@ -314,6 +314,8 @@ final class ProxyServer: @unchecked Sendable {
                     "usage": [
                         "input_tokens": result.inputTokens,
                         "output_tokens": result.outputTokens,
+                        "cache_creation_input_tokens": 0,
+                        "cache_read_input_tokens": 0,
                     ],
                 ]
                 let body = try! JSONSerialization.data(withJSONObject: response)
@@ -323,15 +325,15 @@ final class ProxyServer: @unchecked Sendable {
         }
     }
 
-    // MARK: - SSE streaming response
+    // MARK: - SSE streaming response (Anthropic Messages API spec)
 
     private func sendStreamingResponse(on connection: NWConnection, msgId: String, modelName: String,
                                        contentBlocks: [[String: Any]], stopReason: String,
                                        inputTokens: Int, outputTokens: Int) {
         var events = ""
 
-        // 1. message_start
-        let messageStart: [String: Any] = [
+        // 1. message_start — usage.output_tokens inizia a 1 come da spec
+        events += sseEvent("message_start", data: [
             "type": "message_start",
             "message": [
                 "id": msgId,
@@ -341,10 +343,9 @@ final class ProxyServer: @unchecked Sendable {
                 "model": modelName,
                 "stop_reason": NSNull(),
                 "stop_sequence": NSNull(),
-                "usage": ["input_tokens": inputTokens, "output_tokens": 0],
+                "usage": ["input_tokens": inputTokens, "output_tokens": 1, "cache_creation_input_tokens": 0, "cache_read_input_tokens": 0],
             ] as [String: Any],
-        ]
-        events += sseEvent("message_start", data: messageStart)
+        ])
 
         // 2. content blocks
         for (idx, block) in contentBlocks.enumerated() {
@@ -360,8 +361,13 @@ final class ProxyServer: @unchecked Sendable {
                     "content_block": ["type": "text", "text": ""],
                 ] as [String: Any])
 
-                // content_block_delta — emit text in chunks
-                let chunkSize = 20
+                // ping dopo il primo content_block_start (come da spec)
+                if idx == 0 {
+                    events += sseEvent("ping", data: ["type": "ping"])
+                }
+
+                // content_block_delta — chunk da ~80 char (simula streaming realistico)
+                let chunkSize = 80
                 var i = text.startIndex
                 while i < text.endIndex {
                     let end = text.index(i, offsetBy: chunkSize, limitedBy: text.endIndex) ?? text.endIndex
@@ -381,7 +387,7 @@ final class ProxyServer: @unchecked Sendable {
                 ] as [String: Any])
 
             } else if blockType == "tool_use" {
-                // content_block_start for tool_use
+                // content_block_start per tool_use
                 events += sseEvent("content_block_start", data: [
                     "type": "content_block_start",
                     "index": idx,
@@ -393,7 +399,14 @@ final class ProxyServer: @unchecked Sendable {
                     ] as [String: Any],
                 ] as [String: Any])
 
-                // input_json_delta
+                // primo delta vuoto come da spec
+                events += sseEvent("content_block_delta", data: [
+                    "type": "content_block_delta",
+                    "index": idx,
+                    "delta": ["type": "input_json_delta", "partial_json": ""],
+                ] as [String: Any])
+
+                // input_json_delta con il JSON completo
                 let input = block["input"] ?? [String: Any]()
                 let inputJson = (try? JSONSerialization.data(withJSONObject: input))
                     .flatMap { String(data: $0, encoding: .utf8) } ?? "{}"
@@ -411,17 +424,15 @@ final class ProxyServer: @unchecked Sendable {
             }
         }
 
-        // 3. message_delta
+        // 3. message_delta — usage.output_tokens è cumulativo
         events += sseEvent("message_delta", data: [
             "type": "message_delta",
             "delta": ["stop_reason": stopReason, "stop_sequence": NSNull()] as [String: Any],
-            "usage": ["output_tokens": outputTokens],
+            "usage": ["output_tokens": outputTokens, "cache_creation_input_tokens": 0, "cache_read_input_tokens": 0],
         ] as [String: Any])
 
         // 4. message_stop
-        events += sseEvent("message_stop", data: [
-            "type": "message_stop",
-        ] as [String: Any])
+        events += sseEvent("message_stop", data: ["type": "message_stop"])
 
         sendSSE(on: connection, events: events)
     }
@@ -432,14 +443,17 @@ final class ProxyServer: @unchecked Sendable {
         return "event: \(event)\ndata: \(jsonStr)\n\n"
     }
 
+    /// Invia la risposta SSE completa e chiude la connessione con TCP FIN (non RST).
     private func sendSSE(on connection: NWConnection, events: String) {
         let headers = corsHeaders(contentType: "text/event-stream")
         + "Cache-Control: no-cache\r\n"
-        + "Connection: close\r\n"
 
         let responseStr = "HTTP/1.1 200 OK\r\n\(headers)\r\n\(events)"
         let responseData = responseStr.data(using: .utf8)!
-        connection.send(content: responseData, completion: .contentProcessed { _ in
+
+        // isComplete: true → TCP FIN graceful (non RST da cancel)
+        connection.send(content: responseData, contentContext: .finalMessage, isComplete: true,
+                       completion: .contentProcessed { _ in
             connection.cancel()
         })
     }
@@ -449,7 +463,7 @@ final class ProxyServer: @unchecked Sendable {
     private func corsHeaders(contentType: String? = nil) -> String {
         var h = "Access-Control-Allow-Origin: *\r\n"
         h += "Access-Control-Allow-Methods: GET, POST, OPTIONS\r\n"
-        h += "Access-Control-Allow-Headers: Content-Type, Authorization, x-api-key, anthropic-version\r\n"
+        h += "Access-Control-Allow-Headers: *\r\n"
         if let ct = contentType {
             h += "Content-Type: \(ct)\r\n"
         }
